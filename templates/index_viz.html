@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Trilateration Visualization</title>
+  <style>
+    canvas {
+      border: 1px solid #000;
+      background-color: #f9f9f9;
+    }
+    body {
+      font-family: Arial, sans-serif;
+    }
+  </style>
+</head>
+<body>
+  <h1>Real-Time Visualization</h1>
+  <canvas id="trilaterationCanvas" width="1400" height="500"></canvas>
+  <script>
+    const canvas = document.getElementById('trilaterationCanvas');
+    const ctx = canvas.getContext('2d');
+
+    // Room dimensions
+    const roomLength = 7.93; 
+    const roomWidth =3.94;  
+
+   
+    const viewAreaXMin = -roomLength;
+    const viewAreaXMax = roomLength; 
+    const viewAreaYMin = -2;         
+    const viewAreaYMax = roomWidth + 4;
+    
+    const viewAreaWidth = viewAreaXMax - viewAreaXMin;
+    const viewAreaHeight = viewAreaYMax - viewAreaYMin;
+
+    const canvasWidth = canvas.width;
+    const canvasHeight = canvas.height;
+
+    const margin = 20; 
+
+    const drawWidth = canvasWidth - 2 * margin;
+    const drawHeight = canvasHeight - 2 * margin;
+
+    const scaleX = drawWidth / viewAreaWidth;
+    const scaleY = drawHeight / viewAreaHeight;
+
+    // Anchor positions
+    const anchors = {
+      "7c:df:a1:0f:af:45": { x: -2.80,    y: 0.00,     z: 2.08 },
+      "7c:df:a1:0f:af:01": { x: 0.00,    y: 3.58,  z: 2.04 }, 
+      "7c:df:a1:0e:d7:eb": { x: 3.43, y: 0.00,     z: 1.84 } 
+    };
+
+    // Convert world coordinates to canvas coordinates
+    function toCanvasCoords(x, y) {
+      const canvasX = margin + (x - viewAreaXMin) * scaleX;
+      const canvasY = canvasHeight - margin - (y - viewAreaYMin) * scaleY;
+      return { canvasX, canvasY };
+    }
+
+    // Draw the room outline and coordinate grid
+    function drawRoom() {
+      ctx.clearRect(0, 0, canvasWidth, canvasHeight);
+      
+      // Draw coordinate grid
+      ctx.strokeStyle = "#ddd";
+      ctx.lineWidth = 1;
+      
+      // Draw horizontal grid lines
+      for (let y = Math.floor(viewAreaYMin); y <= Math.ceil(viewAreaYMax); y++) {
+        const { canvasX: startX, canvasY } = toCanvasCoords(viewAreaXMin, y);
+        const { canvasX: endX } = toCanvasCoords(viewAreaXMax, y);
+        
+        ctx.beginPath();
+        ctx.moveTo(startX, canvasY);
+        ctx.lineTo(endX, canvasY);
+        ctx.stroke();
+        // Add y-axis labels
+        ctx.fillStyle = "#666";
+        ctx.font = "10px Arial";
+        ctx.fillText(y.toString(), margin - 15, canvasY + 4);
+      }
+      
+      // Draw vertical grid lines
+      for (let x = Math.floor(viewAreaXMin); x <= Math.ceil(viewAreaXMax); x++) {
+        const { canvasX, canvasY: startY } = toCanvasCoords(x, viewAreaYMin);
+        const { canvasY: endY } = toCanvasCoords(x, viewAreaYMax);
+        
+        ctx.beginPath();
+        ctx.moveTo(canvasX, startY);
+        ctx.lineTo(canvasX, endY);
+        ctx.stroke();
+        
+        // Add x-axis labels
+        ctx.fillStyle = "#666";
+        ctx.font = "10px Arial";
+        ctx.fillText(x.toString(), canvasX - 4, canvasHeight - margin + 15);
+      }
+      
+      ctx.strokeStyle = "#999";
+      ctx.lineWidth = 2;
+      
+      // X-axis (y=0)
+      const { canvasX: xAxisStartX, canvasY: xAxisY } = toCanvasCoords(viewAreaXMin, 0);
+      const { canvasX: xAxisEndX } = toCanvasCoords(viewAreaXMax, 0);
+      ctx.beginPath();
+      ctx.moveTo(xAxisStartX, xAxisY);
+      ctx.lineTo(xAxisEndX, xAxisY);
+      ctx.stroke();
+      
+      // Y-axis (x=0)
+      const { canvasX: yAxisX, canvasY: yAxisStartY } = toCanvasCoords(0, viewAreaYMin);
+      const { canvasY: yAxisEndY } = toCanvasCoords(0, viewAreaYMax);
+      ctx.beginPath();
+      ctx.moveTo(yAxisX, yAxisStartY);
+      ctx.lineTo(yAxisX, yAxisEndY);
+      ctx.stroke();
+      
+      ctx.strokeStyle = "blue";
+      ctx.lineWidth = 2;
+      const topLeft = toCanvasCoords(-roomLength / 2, roomWidth);
+      const bottomRight = toCanvasCoords(roomLength / 2, 0);
+      ctx.strokeRect(topLeft.canvasX, topLeft.canvasY, bottomRight.canvasX - topLeft.canvasX, bottomRight.canvasY - topLeft.canvasY);
+
+      ctx.fillStyle = "blue";
+      ctx.font = "12px Arial";
+      ctx.fillText("Room", topLeft.canvasX + 5, topLeft.canvasY - 5);
+    }
+
+    // Draw static anchors with labels showing their MAC address and coordinates
+    function drawAnchors() {
+      for (const mac in anchors) {
+        const anchor = anchors[mac];
+        const pos = toCanvasCoords(anchor.x, anchor.y);
+        ctx.fillStyle = "red";
+        ctx.beginPath();
+        ctx.arc(pos.canvasX, pos.canvasY, 6, 0, 2 * Math.PI);
+        ctx.fill();
+        ctx.fillStyle = "black";
+        ctx.font = "12px Arial";
+        ctx.fillText(mac, pos.canvasX + 8, pos.canvasY - 8);
+        ctx.fillText(`(${anchor.x.toFixed(2)}, ${anchor.y.toFixed(2)}, ${anchor.z.toFixed(2)})`, pos.canvasX + 8, pos.canvasY + 12);
+      }
+    }
+
+    // Draw only the current trilaterated position point (latest data)
+    function drawTrilaterationPoint(point) {
+      const pos = toCanvasCoords(point.x, point.y);
+      ctx.fillStyle = "blue";
+      ctx.beginPath();
+      ctx.arc(pos.canvasX, pos.canvasY, 6, 0, 2 * Math.PI);
+      ctx.fill();
+      ctx.fillStyle = "black";
+      ctx.font = "12px Arial";
+      // Display the coordinate values (x, y, z)
+      ctx.fillText(`(${point.x.toFixed(2)}, ${point.y.toFixed(2)}, ${point.z.toFixed(2)})`, pos.canvasX + 8, pos.canvasY);
+    }
+
+    // Fetch calculated position logs from the server
+    async function fetchPositions() {
+      try {
+        const response = await fetch('/logs');
+        const logs = await response.json();
+        // Extract positions from the logs
+        const positions = logs.map(item => item.position);
+        return positions;
+      } catch (error) {
+        console.error("Failed to fetch logs:", error);
+        return [];
+      }
+    }
+
+    async function updateCanvas() {
+      drawRoom();
+      drawAnchors();
+      const positions = await fetchPositions();
+      if (positions.length > 0) {
+        const latestPoint = positions[positions.length - 1];
+        drawTrilaterationPoint(latestPoint);
+      }
+    }
+
+    // Periodically update the canvas
+    setInterval(updateCanvas, 3000);
+    
+    // Initial drawing on page load
+    updateCanvas();
+  </script>
+</body>
+</html>
