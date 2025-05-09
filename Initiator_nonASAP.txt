@@ -1,0 +1,735 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <time.h>
+#include <inttypes.h>  
+#include <errno.h>     
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "freertos/queue.h"
+#include "esp_wifi.h"
+#include "esp_wifi_types.h"            
+#include "esp_event.h"
+#include "esp_log.h"
+#include "esp_http_client.h"
+#include "nvs_flash.h"
+#include "sys/time.h"
+#include "esp_sntp.h"                  
+#include "esp_timer.h"                 
+#include "esp_heap_caps.h"             
+
+#ifndef MACSTR
+#define MACSTR "%02x:%02x:%02x:%02x:%02x:%02x"
+#endif
+
+#ifndef MAC2STR
+#define MAC2STR(a) (a)[0], (a)[1], (a)[2], (a)[3], (a)[4], (a)[5]
+#endif
+
+
+#define ROUTER_SSID "xxxxx"
+#define ROUTER_PASS "xxxxx"
+
+// Server URL
+#define SERVER_URL "http://192.168.xxx.xxx:xxx/ftm_data"
+
+
+#define MAX_ANCHORS 3
+const char *TARGET_SSIDS[MAX_ANCHORS] = {"ftm_7CDFA10FAF44", "ftm_7CDFA10FAF00", "ftm_7CDFA10ED7EA"};
+const char *TARGET_PASSPHRASES[MAX_ANCHORS] = {"", "", ""}; 
+static const int NUM_SSIDS = MAX_ANCHORS;
+static int current_ssid_index = 0;  // Keep track of the current SSID being processed
+
+static int64_t s_rtt_est = 0;  
+static int64_t s_dist_est = 0;
+
+static const char *TAG = "ftm_initiator";
+static const char *TAG_STA = "ftm_sta";
+
+// Function prototypes
+static bool send_data_to_server(const char *json_data);
+static void http_send_task(void *pvParameters);
+static void wifi_scan_task(void *pvParameters);
+static esp_err_t do_ftm_connected();
+static void process_next_anchor();
+static void monitor_task(void *pvParameters);
+void initialize_sntp(void);
+void initialise_wifi(void);
+
+// Event group handles
+static EventGroupHandle_t wifi_event_group;
+const int CONNECTED_BIT = BIT0;
+const int DISCONNECTED_BIT = BIT1;
+
+static EventGroupHandle_t ftm_event_group;
+const int FTM_REPORT_BIT = BIT0;
+const int FTM_FAILURE_BIT = BIT1;
+
+
+static EventGroupHandle_t ip_event_group;
+const int GOT_IP_BIT = BIT0;
+
+
+static EventGroupHandle_t data_event_group;
+const int DATA_SENT_BIT = BIT0;
+
+// Queue for FTM data
+static QueueHandle_t ftm_data_queue;
+
+// Flag to prevent multiple enqueues per FTM session
+static bool json_enqueued = false;
+
+// Global variable to track connection to the router
+static bool connected_to_router = false;
+
+// Function to log detailed heap usage
+static void log_detailed_heap_usage(const char *tag) {
+    size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+    size_t total_heap = heap_caps_get_total_size(MALLOC_CAP_DEFAULT);
+    size_t largest_free_block = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+    ESP_LOGI(tag, "Heap: Free = %lu bytes, Total = %lu bytes, Largest Free Block = %lu bytes",
+             (unsigned long)free_heap,
+             (unsigned long)total_heap,
+             (unsigned long)largest_free_block);
+}
+
+// Function to check stack usage
+static void check_stack_usage(const char *task_name) {
+    TaskHandle_t task = xTaskGetHandle(task_name);
+    if (task != NULL) {
+        UBaseType_t high_water_mark = uxTaskGetStackHighWaterMark(task);
+        ESP_LOGI(TAG, "Task '%s' High Water Mark: %u bytes", task_name, (unsigned int)(high_water_mark * sizeof(StackType_t)));
+    } else {
+        ESP_LOGW(TAG, "Task '%s' not found", task_name);
+    }
+}
+
+// Monitoring task to log heap and stack usage
+static void monitor_task(void *pvParameters) {
+    while (1) {
+        log_detailed_heap_usage("HEAP_MONITOR");
+        check_stack_usage("http_send_task");
+        check_stack_usage("wifi_scan_task");
+        vTaskDelay(pdMS_TO_TICKS(5000));  // Every 5 seconds
+    }
+}
+
+// Event handler for Wi-Fi and FTM events
+static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
+    ESP_LOGI(TAG, "Received event: %s, ID: %" PRId32, event_base, event_id);
+
+    if (event_base == WIFI_EVENT) {
+        if (event_id == WIFI_EVENT_STA_CONNECTED) {
+            wifi_event_sta_connected_t *event = (wifi_event_sta_connected_t *)event_data;
+
+    
+            char ssid[33];
+            memset(ssid, 0, sizeof(ssid));
+            memcpy(ssid, event->ssid, event->ssid_len);
+
+            ESP_LOGI(TAG_STA, "Connected to %s (BSSID: " MACSTR ", Channel: %d)",
+                     ssid, MAC2STR(event->bssid), event->channel);
+
+            xEventGroupClearBits(wifi_event_group, DISCONNECTED_BIT);
+            xEventGroupSetBits(wifi_event_group, CONNECTED_BIT);
+
+            // Check if connected to the router
+            if (strcmp(ssid, ROUTER_SSID) == 0) {
+                connected_to_router = true;
+                ESP_LOGI(TAG, "Connected to router SSID");
+            } else {
+                connected_to_router = false;
+                ESP_LOGI(TAG, "Connected to anchor SSID");
+            }
+
+        } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
+            ESP_LOGI(TAG_STA, "Disconnected from Wi-Fi network");
+            xEventGroupClearBits(wifi_event_group, CONNECTED_BIT);
+            xEventGroupSetBits(wifi_event_group, DISCONNECTED_BIT);
+
+            xEventGroupClearBits(ip_event_group, GOT_IP_BIT);
+
+            connected_to_router = false;
+        } else if (event_id == WIFI_EVENT_FTM_REPORT) {
+            wifi_event_ftm_report_t *event = (wifi_event_ftm_report_t *)event_data;
+
+            s_rtt_est = event->rtt_est;
+            s_dist_est = event->dist_est;
+
+            if (event->status == FTM_STATUS_SUCCESS) {
+                ESP_LOGI(TAG_STA, "FTM procedure successful!");
+
+                // Calculate raw distance
+                float raw_distance = s_dist_est / 100.0f;  // centimeters to meters
+                ESP_LOGI(TAG_STA, "Estimated distance: %.2f meters", raw_distance);
+
+                // Get current timestamp
+                struct timeval now;
+                gettimeofday(&now, NULL);
+                int64_t timestamp = (int64_t)now.tv_sec * 1000LL + now.tv_usec / 1000LL; 
+
+                // Convert MAC address to string
+                char mac_str[18];
+                snprintf(mac_str, sizeof(mac_str), MACSTR, MAC2STR(event->peer_mac));
+
+                // Construct JSON data using dynamic memory allocation
+                char *json_buffer = malloc(256);
+                if (json_buffer == NULL) {
+                    ESP_LOGE(TAG, "Failed to allocate memory for JSON buffer");
+                    return;
+                }
+                int json_length = snprintf(json_buffer, 256,
+                                           "{\"anchor_mac\":\"%s\",\"distance\":%.2f,\"timestamp\":%" PRId64 "}",
+                                           mac_str, raw_distance, timestamp);
+
+                if (json_length < 0 || json_length >= 256) {
+                    ESP_LOGE(TAG, "JSON buffer overflow");
+                    free(json_buffer);
+                } else {
+                    // Enqueue JSON data with dropping oldest if queue is full
+                    if (!json_enqueued) {
+                        ESP_LOGI(TAG, "Enqueuing JSON data: %s", json_buffer);
+                        if (xQueueSend(ftm_data_queue, json_buffer, pdMS_TO_TICKS(100)) == pdTRUE) {
+                            ESP_LOGI(TAG, "JSON data enqueued successfully");
+                            json_enqueued = true;
+                        } else {
+                            // Queue is full, drop the oldest data and enqueue the new data
+                            char dropped_data[256];
+                            if (xQueueReceive(ftm_data_queue, dropped_data, pdMS_TO_TICKS(100)) == pdTRUE) {
+                                ESP_LOGW(TAG, "Queue full. Dropped oldest data.");
+                                if (xQueueSend(ftm_data_queue, json_buffer, pdMS_TO_TICKS(100)) == pdTRUE) {
+                                    ESP_LOGI(TAG, "Enqueued new JSON data after dropping oldest.");
+                                    json_enqueued = true;
+                                } else {
+                                    ESP_LOGE(TAG, "Failed to enqueue JSON data even after dropping oldest.");
+                                }
+                            } else {
+                                ESP_LOGE(TAG, "Failed to dequeue oldest data from full queue.");
+                            }
+                        }
+                    } else {
+                        ESP_LOGW(TAG, "JSON data already enqueued for this FTM session");
+                    }
+                    free(json_buffer);
+                }
+
+                // Signal that FTM report is ready
+                xEventGroupSetBits(ftm_event_group, FTM_REPORT_BIT);
+            } else {
+                ESP_LOGE(TAG_STA, "FTM procedure failed with status: %d", event->status);
+                xEventGroupSetBits(ftm_event_group, FTM_FAILURE_BIT);
+            }
+        }
+    } else if (event_base == IP_EVENT) {
+        if (event_id == IP_EVENT_STA_GOT_IP) {
+            if (connected_to_router) {
+                ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+                ESP_LOGI(TAG, "Got IP address: " IPSTR, IP2STR(&event->ip_info.ip));
+                xEventGroupSetBits(ip_event_group, GOT_IP_BIT);
+            } else {
+                ESP_LOGI(TAG, "Ignoring IP_EVENT_STA_GOT_IP as not connected to router");
+            }
+        } else if (event_id == IP_EVENT_STA_LOST_IP) {
+            ESP_LOGI(TAG, "Lost IP address");
+            xEventGroupClearBits(ip_event_group, GOT_IP_BIT);
+        }
+    }
+}
+
+// Function to connect to the anchor's AP
+static bool connect_to_anchor(const char *ssid, const char *passphrase) {
+    // Disconnect from any current Wi-Fi connection
+    // Stop DHCP client
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (netif) {
+        esp_err_t dhcp_err = esp_netif_dhcpc_stop(netif);
+        if (dhcp_err != ESP_OK && dhcp_err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED) {
+            ESP_LOGE(TAG, "Failed to stop DHCP client: %s", esp_err_to_name(dhcp_err));
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to get netif handle for DHCP client");
+    }
+
+    esp_wifi_disconnect();
+
+    xEventGroupClearBits(wifi_event_group, CONNECTED_BIT | DISCONNECTED_BIT);
+    xEventGroupClearBits(ip_event_group, GOT_IP_BIT);
+
+    wifi_config_t wifi_config = { 0 };
+    strlcpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
+
+    if (passphrase == NULL || strlen(passphrase) == 0) {
+        // Open network
+        wifi_config.sta.password[0] = '\0';
+        wifi_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    } else {
+        // Network with password
+        strlcpy((char *)wifi_config.sta.password, passphrase, sizeof(wifi_config.sta.password));
+        wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    }
+
+    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
+
+    ESP_LOGI(TAG_STA, "Connecting to Anchor AP: SSID=%s", ssid);
+
+    esp_err_t err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG_STA, "Failed to initiate Wi-Fi connection to anchor: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    // Wait for connection
+    EventBits_t bits = xEventGroupWaitBits(wifi_event_group, CONNECTED_BIT | DISCONNECTED_BIT,
+                                           pdFALSE, pdFALSE, pdMS_TO_TICKS(10000));  
+
+    if (bits & CONNECTED_BIT) {
+        ESP_LOGI(TAG_STA, "Successfully connected to Anchor AP: %s", ssid);
+        return true;
+    } else {
+        ESP_LOGE(TAG_STA, "Failed to connect to Anchor AP: %s", ssid);
+        return false;
+    }
+}
+
+// Function to connect to router
+static bool connect_to_router() {
+    const int max_retries = 3;
+    int retry_count = 0;
+    bool connected = false;
+
+    while (retry_count < max_retries && !connected) {
+        // Disconnect from any current Wi-Fi connection
+        // Stop DHCP client
+        esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        if (netif) {
+            esp_err_t dhcp_err = esp_netif_dhcpc_stop(netif);
+            if (dhcp_err != ESP_OK && dhcp_err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED) {
+                ESP_LOGE(TAG, "Failed to stop DHCP client: %s", esp_err_to_name(dhcp_err));
+            }
+        } else {
+            ESP_LOGE(TAG, "Failed to get netif handle for DHCP client");
+        }
+
+        esp_wifi_disconnect();
+
+
+        xEventGroupClearBits(wifi_event_group, CONNECTED_BIT | DISCONNECTED_BIT);
+        xEventGroupClearBits(ip_event_group, GOT_IP_BIT);
+
+        wifi_config_t wifi_config = { 0 };
+        strlcpy((char *)wifi_config.sta.ssid, ROUTER_SSID, sizeof(wifi_config.sta.ssid));
+        strlcpy((char *)wifi_config.sta.password, ROUTER_PASS, sizeof(wifi_config.sta.password));
+        wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+
+        ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
+
+        ESP_LOGI(TAG_STA, "Connecting to Router: SSID=%s", ROUTER_SSID);
+
+        esp_err_t err = esp_wifi_connect();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG_STA, "Failed to initiate Wi-Fi connection to router: %s", esp_err_to_name(err));
+            retry_count++;
+            vTaskDelay(pdMS_TO_TICKS(2000)); 
+            continue;
+        }
+
+        // Start DHCP client
+        if (netif) {
+            esp_err_t dhcp_err = esp_netif_dhcpc_start(netif);
+            if (dhcp_err != ESP_OK && dhcp_err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
+                ESP_LOGE(TAG, "Failed to start DHCP client: %s", esp_err_to_name(dhcp_err));
+            }
+        }
+
+        // Wait for connection
+        EventBits_t bits = xEventGroupWaitBits(wifi_event_group, CONNECTED_BIT | DISCONNECTED_BIT,
+                                               pdFALSE, pdFALSE, pdMS_TO_TICKS(15000));
+
+        if (bits & CONNECTED_BIT) {
+            ESP_LOGI(TAG_STA, "Successfully connected to Router: %s", ROUTER_SSID);
+
+            // Wait for IP address
+            bits = xEventGroupWaitBits(ip_event_group, GOT_IP_BIT,
+                                       pdFALSE, pdTRUE, pdMS_TO_TICKS(10000)); 
+
+            if (bits & GOT_IP_BIT) {
+                ESP_LOGI(TAG, "IP address assigned. Ready to send data.");
+                connected = true;
+            } else {
+                ESP_LOGE(TAG, "Failed to obtain IP address after connecting to router.");
+                retry_count++;
+                vTaskDelay(pdMS_TO_TICKS(2000)); 
+            }
+        } else {
+            ESP_LOGE(TAG_STA, "Failed to connect to Router: %s", ROUTER_SSID);
+            retry_count++;
+            vTaskDelay(pdMS_TO_TICKS(2000));
+        }
+    }
+
+    return connected;
+}
+
+// Function to initiate an FTM session with the connected AP
+static esp_err_t do_ftm_connected() {
+    // Check available heap
+    size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+    const size_t required_heap = 16000; 
+
+    if (free_heap < required_heap) {
+        ESP_LOGE(TAG_STA, "Insufficient heap (%lu bytes) to initiate FTM session. Required: %lu bytes",
+                 (unsigned long)free_heap, (unsigned long)required_heap);
+        return ESP_ERR_NO_MEM;
+    }
+
+    wifi_ap_record_t ap_info;
+    esp_err_t err = esp_wifi_sta_get_ap_info(&ap_info);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG_STA, "Failed to get AP info: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG_STA, "Starting FTM with connected AP: " MACSTR " on channel %d",
+             MAC2STR(ap_info.bssid), ap_info.primary);
+
+    wifi_ftm_initiator_cfg_t ftmi_cfg = {
+        .frm_count = 32,               
+        .burst_period = 2,         
+        .channel = ap_info.primary,  
+        .resp_mac = {0},         
+    };
+    memcpy(ftmi_cfg.resp_mac, ap_info.bssid, sizeof(ftmi_cfg.resp_mac));
+
+    // Initiate the FTM session
+    err = esp_wifi_ftm_initiate_session(&ftmi_cfg);
+    if (err != ESP_OK) {
+        if (err == ESP_ERR_NO_MEM) {
+            ESP_LOGE(TAG_STA, "Failed to start FTM session due to memory allocation failure.");
+            log_detailed_heap_usage(TAG_STA);
+        } else {
+            ESP_LOGE(TAG_STA, "Failed to start FTM session: %s", esp_err_to_name(err));
+        }
+        xEventGroupSetBits(ftm_event_group, FTM_FAILURE_BIT);
+        return err;
+    }
+
+    return err;
+}
+
+// Send data to the server
+static bool send_data_to_server(const char *json_data) {
+    const int max_retries = 3;
+    int retry_count = 0;
+    bool success = false;
+    esp_http_client_handle_t client = NULL;
+
+    while (retry_count < max_retries && !success) {
+        ESP_LOGI(TAG, "Attempting to send data: %s", json_data);
+
+        // Define the HTTP client configuration
+        esp_http_client_config_t config = {
+            .url = SERVER_URL,
+            .timeout_ms = 10000,                      
+            .keep_alive_enable = false,               
+            .disable_auto_redirect = true,
+            .transport_type = HTTP_TRANSPORT_OVER_TCP, 
+        };
+
+        // Initialize a new HTTP client for each request
+        client = esp_http_client_init(&config);
+        if (client == NULL) {
+            ESP_LOGE(TAG, "Failed to initialize HTTP client");
+            return false;
+        }
+
+        // Set HTTP method and headers
+        esp_http_client_set_method(client, HTTP_METHOD_POST);
+        esp_http_client_set_header(client, "Content-Type", "application/json");
+        esp_http_client_set_post_field(client, json_data, strlen(json_data));
+
+        // Perform the HTTP request
+        esp_err_t err = esp_http_client_perform(client);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "HTTP POST Status = %d, content_length = %lld",
+                     esp_http_client_get_status_code(client),
+                     esp_http_client_get_content_length(client));
+            success = true;
+        } else {
+            ESP_LOGE(TAG, "HTTP POST request failed: %s", esp_err_to_name(err));
+            int sock_err = errno;
+            ESP_LOGE(TAG, "Socket error errno: %d", sock_err);
+            retry_count++;
+            vTaskDelay(pdMS_TO_TICKS(2000)); // Wait for 2 seconds before retrying
+        }
+
+        esp_http_client_cleanup(client);
+        client = NULL;
+    }
+
+    if (!success) {
+        ESP_LOGE(TAG, "Failed to send HTTP POST after %d retries", max_retries);
+    }
+
+    return success;
+}
+
+// Task to handle HTTP data transmission
+static void http_send_task(void *pvParameters) {
+    char json_data[256];
+    while (1) {
+        if (xQueueReceive(ftm_data_queue, json_data, portMAX_DELAY)) {
+            ESP_LOGI(TAG, "Received JSON data from queue: %s", json_data);
+
+            // Wait for the IP address to be assigned
+            EventBits_t bits = xEventGroupWaitBits(ip_event_group, GOT_IP_BIT,
+                                                   pdFALSE, pdTRUE, pdMS_TO_TICKS(10000));  
+
+            if (bits & GOT_IP_BIT) {
+                ESP_LOGI(TAG, "Network ready, attempting to send data.");
+                bool sent = send_data_to_server(json_data);
+                // Reset the enqueue flag after attempting to send, regardless of success
+                json_enqueued = false;
+
+                xEventGroupSetBits(data_event_group, DATA_SENT_BIT);
+
+                if (!sent) {
+                    ESP_LOGE(TAG, "Failed to send data to server.");
+                }
+            } else {
+                ESP_LOGE(TAG, "Failed to obtain IP address. Data will not be sent.");
+                // Reset the enqueue flag and signal to proceed
+                json_enqueued = false;
+                xEventGroupSetBits(data_event_group, DATA_SENT_BIT);
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+// Task to handle Wi-Fi scanning and FTM
+static void wifi_scan_task(void *pvParameters) {
+    while (1) {
+        process_next_anchor();
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+
+// Function to process the next anchor (SSID)
+static void process_next_anchor() {
+    // Wait for previous data to be sent
+    EventBits_t bits = xEventGroupWaitBits(data_event_group, DATA_SENT_BIT,
+                                           pdTRUE, pdTRUE, pdMS_TO_TICKS(10000));
+
+    if ((bits & DATA_SENT_BIT) == 0) {
+        ESP_LOGW(TAG, "Previous data not sent. Proceeding anyway.");
+        // Optionally, you can set the DATA_SENT_BIT here to prevent future blocking
+        xEventGroupSetBits(data_event_group, DATA_SENT_BIT);
+    }
+
+    const char *current_ssid = TARGET_SSIDS[current_ssid_index];
+    const char *current_passphrase = TARGET_PASSPHRASES[current_ssid_index];
+
+    ESP_LOGI(TAG, "Processing SSID: %s", current_ssid);
+
+    // Connect to the anchor AP
+    if (connect_to_anchor(current_ssid, current_passphrase)) {
+        // Start timer
+        int64_t start_time = esp_timer_get_time();  // in microseconds
+        ESP_LOGI(TAG, "FTM session start time: %" PRId64 " us", start_time);
+
+        // Initiate FTM session
+        esp_err_t ftm_ret = do_ftm_connected();
+
+        if (ftm_ret == ESP_OK) {
+            // Wait for FTM report or failure
+            bits = xEventGroupWaitBits(ftm_event_group, FTM_REPORT_BIT | FTM_FAILURE_BIT,
+                                       pdTRUE, pdFALSE, pdMS_TO_TICKS(10000));  // Wait up to 10 seconds
+
+            if (bits & FTM_REPORT_BIT) {
+                // FTM measurement successful
+                ESP_LOGI(TAG, "FTM measurement successful for SSID: %s", current_ssid);
+            } else if (bits & FTM_FAILURE_BIT) {
+                // FTM measurement failed
+                ESP_LOGW(TAG, "FTM measurement failed for SSID: %s", current_ssid);
+            } else {
+                ESP_LOGW(TAG, "FTM measurement timed out for SSID: %s", current_ssid);
+            }
+        } else {
+            ESP_LOGE(TAG, "Failed to initiate FTM session with SSID: %s", current_ssid);
+        }
+
+        // Stop timer
+        int64_t end_time = esp_timer_get_time();
+        ESP_LOGI(TAG, "FTM session took %" PRId64 " ms", (end_time - start_time) / 1000);
+
+        // Disconnect from the anchor AP
+        esp_wifi_disconnect();
+        xEventGroupClearBits(wifi_event_group, CONNECTED_BIT | DISCONNECTED_BIT);
+        xEventGroupClearBits(ip_event_group, GOT_IP_BIT);
+
+        // Reconnect to router to send data
+        if (connect_to_router()) {
+            ESP_LOGI(TAG, "Reconnected to router and ready to send data.");
+        } else {
+            ESP_LOGE(TAG, "Failed to reconnect to router.");
+            // Signal that data has been "sent" to proceed
+            xEventGroupSetBits(data_event_group, DATA_SENT_BIT);
+            // Reset json_enqueued to allow new data
+            json_enqueued = false;
+        }
+
+    } else {
+        ESP_LOGW(TAG, "Failed to connect to SSID: %s", current_ssid);
+        // Signal that data has been "sent" to proceed
+        xEventGroupSetBits(data_event_group, DATA_SENT_BIT);
+        // Reset json_enqueued to allow new data
+        json_enqueued = false;
+    }
+
+    // Move to the next SSID
+    current_ssid_index++;
+    if (current_ssid_index >= NUM_SSIDS) {
+        current_ssid_index = 0;  // Reset to first SSID after completing all
+    }
+}
+
+// Function to initialize SNTP
+void initialize_sntp(void) {
+    static bool sntp_initialized = false;
+
+    if (sntp_initialized) {
+        ESP_LOGI(TAG, "SNTP is already initialized.");
+        return;
+    }
+
+    ESP_LOGI(TAG, "Initializing SNTP");
+    sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    sntp_setservername(0, "pool.ntp.org"); 
+    sntp_init();
+
+    sntp_initialized = true;
+
+    // Wait for time to be set
+    time_t now = 0;
+    struct tm timeinfo = {0};
+    int retry = 0;
+    const int retry_count = 10;
+    while (timeinfo.tm_year < (2016 - 1900) && ++retry < retry_count) {
+        ESP_LOGI(TAG, "Waiting for system time to be set... (%d/%d)", retry, retry_count);
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        time(&now);
+        localtime_r(&now, &timeinfo);
+    }
+
+    if (timeinfo.tm_year < (2016 - 1900)) {
+        ESP_LOGW(TAG, "System time not set. Proceeding without SNTP synchronization.");
+    } else {
+        ESP_LOGI(TAG, "System time is set.");
+    }
+}
+
+// Function to initialize Wi-Fi
+void initialise_wifi(void) {
+    static bool initialized = false;
+
+    if (initialized) {
+        return;
+    }
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    wifi_event_group = xEventGroupCreate();
+    ftm_event_group = xEventGroupCreate();
+    ip_event_group = xEventGroupCreate();  // Create IP event group
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    // Create default Wi-Fi station
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+    if (sta_netif == NULL) {
+        ESP_LOGE(TAG, "Failed to create default Wi-Fi station");
+        return;
+    }
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+
+    // Register event handlers
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &event_handler,
+                                                        NULL,
+                                                        NULL));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,   
+                                                        ESP_EVENT_ANY_ID,
+                                                        &event_handler,
+                                                        NULL,
+                                                        NULL));
+
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+
+    // Start Wi-Fi
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    // Connect to router initially
+    if (connect_to_router()) {
+        ESP_LOGI(TAG, "Connected to router on startup.");
+    } else {
+        ESP_LOGE(TAG, "Failed to connect to router on startup.");
+    }
+
+    initialized = true;
+}
+
+void app_main(void) {
+    // Initialize NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    // Initialize Wi-Fi
+    initialise_wifi();
+
+    // Initialize SNTP for time synchronization
+    initialize_sntp();
+
+    // Create event groups
+    data_event_group = xEventGroupCreate();
+    if (data_event_group == NULL) {
+        ESP_LOGE(TAG, "Failed to create data_event_group");
+        return;
+    }
+    xEventGroupSetBits(data_event_group, DATA_SENT_BIT); 
+    // Create a queue to hold FTM data
+    ftm_data_queue = xQueueCreate(20, sizeof(char) * 256);  
+    if (ftm_data_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create ftm_data_queue");
+        return;
+    }
+
+    // Create tasks
+    if (xTaskCreate(&wifi_scan_task, "wifi_scan_task", 3072, NULL, 5, NULL) != pdPASS) {   
+        ESP_LOGE(TAG, "Failed to create wifi_scan_task");
+        return;
+    }
+    if (xTaskCreate(&http_send_task, "http_send_task", 3072, NULL, 10, NULL) != pdPASS) {  
+        ESP_LOGE(TAG, "Failed to create http_send_task");
+        return;
+    }
+    if (xTaskCreate(&monitor_task, "monitor_task", 2048, NULL, 3, NULL) != pdPASS) {       
+        ESP_LOGE(TAG, "Failed to create monitor_task");
+        return;
+    }
+
+    ESP_LOGI(TAG, "All tasks created successfully. Entering main loop.");
+
+    // Prevent app_main from returning
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    }
